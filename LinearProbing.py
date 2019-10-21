@@ -1,6 +1,6 @@
 from __future__ import print_function
 
-import os
+import os, copy
 import sys
 import time
 import torch
@@ -14,15 +14,20 @@ from torch.utils.data import distributed
 import tensorboard_logger as tb_logger
 
 from torchvision import transforms, datasets
+import torchvision.models as models
 from dataset import RGB2Lab
 from util import adjust_learning_rate, AverageMeter, accuracy
 
 from models.alexnet import alexnet
 from models.resnet import ResNetV2
 from models.LinearModel import LinearClassifierAlexNet, LinearClassifierResNetV2
+from caffenet import CaffeNet_BN
 
 from spawn import spawn
 
+from VideoLoader import VideoLoader, MyVideoFolder
+import spatial_transforms as VT
+from mean import get_mean, get_std
 
 def parse_option():
 
@@ -31,16 +36,16 @@ def parse_option():
     parser.add_argument('--print_freq', type=int, default=10, help='print frequency')
     parser.add_argument('--tb_freq', type=int, default=500, help='tb frequency')
     parser.add_argument('--save_freq', type=int, default=5, help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=256, help='batch_size')
+    parser.add_argument('--batch_size', type=int, default=128, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=32, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=100, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=200, help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.1, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='60,70,80,90', help='where to decay lr, can be a list')
-    parser.add_argument('--lr_decay_rate', type=float, default=0.2, help='decay rate for learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.01, help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='150,200', help='where to decay lr, can be a list')
+    parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
-    parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
+    parser.add_argument('--weight_decay', type=float, default=0.0005, help='weight decay')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam')
 
@@ -48,7 +53,7 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet', 'resnet50', 'resnet101'])
+    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet', 'resnet50', 'resnet101', 'caffenet'])
     parser.add_argument('--model_path', type=str, default=None, help='the model to test')
     parser.add_argument('--layer', type=int, default=5, help='which layer to evaluate')
 
@@ -82,6 +87,10 @@ def parse_option():
                              'fastest way to use PyTorch for either single node or '
                              'multi node data parallel training')
 
+    parser.add_argument('--scratch', action='store_true', help='training from random weights')
+    parser.add_argument('--ten_crop', action='store_true', help='use ten crops for validation')
+    parser.add_argument('--evaluate', action='store_true', help='vaidation only once')
+
     opt = parser.parse_args()
 
     if (opt.data_folder is None) or (opt.save_path is None) or (opt.tb_path is None):
@@ -107,32 +116,96 @@ def parse_option():
     return opt
 
 
+def get_new_features(model, conv, arch):
+    print(arch)
+    children = list(model.features.children())
+    count = 1
+    for i,m in enumerate(children):
+        if (arch == 'vgg16' and isinstance(m, nn.MaxPool2d)) or (arch == 'alexnet' and isinstance(m, nn.ReLU)):
+            if count == conv:
+                break
+            count = count + 1
+    if arch == 'alexnet':
+        i += 2
+    return nn.Sequential(*list(model.features.children())[:i])
+
+
+def input_transformation_no_diff(x):
+    x = torch.transpose(x, 0, 1)
+    return x
+
+
 def get_train_val_loader(args):
     train_folder = os.path.join(args.data_folder, 'train')
     val_folder = os.path.join(args.data_folder, 'val')
 
-    normalize = transforms.Normalize(mean=[(0 + 100) / 2, (-86.183 + 98.233) / 2, (-107.857 + 94.478) / 2],
-                                     std=[(100 - 0) / 2, (86.183 + 98.233) / 2, (107.857 + 94.478) / 2])
-    train_dataset = datasets.ImageFolder(
-        train_folder,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            RGB2Lab(),
-            transforms.ToTensor(),
+    normalize = VT.GroupToNormalizedTensor(mean=get_mean(), std=get_std())
+    transform = [
+            VT.GroupResize(256),
+            VT.GroupRandomCrop(224),
+            VT.GroupRandomHorizontalFlip(),
+            VT.GroupToBGR2RGB(),
+            VT.GroupColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.3),
             normalize,
-        ])
-    )
-    val_dataset = datasets.ImageFolder(
-        val_folder,
-        transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            RGB2Lab(),
-            transforms.ToTensor(),
+            VT.GroupFormat()]
+    transform += [transforms.Lambda(lambda x: input_transformation_no_diff(x))]
+    transform = VT.Compose(transform)
+
+    video_loader = VideoLoader(
+            num_frames=1,
+            step_size=1,
+            diff_stride=0,
+            samples_per_video=1,
+            random_offset=True)
+    train_dataset = MyVideoFolder(
+                train_folder,
+                transform=transform,
+                loader=video_loader,
+                error_paths=[])
+
+
+    transform = [
+            VT.GroupResize(256),
+            VT.GroupCenterCrop(224),
+            VT.GroupToBGR2RGB(),
             normalize,
-        ])
-    )
+            VT.GroupFormat(),
+            transforms.Lambda(lambda x: torch.transpose(x, 0, 1))]
+    if args.ten_crop:
+        grp_rgb2bgr = VT.GroupToBGR2RGB()
+        grp_resize = VT.GroupResize(256)
+        grp_tencrop = VT.GroupTenCrop(224)
+        transform = [
+            transforms.Lambda(lambda clips_list: [ grp_resize(clip) for clip in clips_list ]),
+            transforms.Lambda(lambda clips_list: [ grp_tencrop(clip) for clip in clips_list ]),
+            transforms.Lambda(lambda clipsclips_list: [clip for clips_list in clipsclips_list for clip in clips_list]),
+            transforms.Lambda(lambda crops: [grp_rgb2bgr(crop) for crop in crops]),
+            transforms.Lambda(lambda crops: [normalize(crop) for crop in crops]),
+            VT.GroupFormat(),
+            transforms.Lambda(lambda x: torch.transpose(x, 1, 2))]
+    transform = VT.Compose(transform)
+
+    if args.ten_crop:
+        video_loader = VideoLoader(
+            num_frames=1,
+            step_size=1,
+            diff_stride=0,
+            samples_per_video=25,
+            random_offset=False)
+    else:
+        video_loader = VideoLoader(
+            num_frames=1,
+            step_size=1,
+            diff_stride=0,
+            samples_per_video=1,
+            random_offset=False)
+    val_dataset = MyVideoFolder(
+                val_folder,
+                transform=transform,
+                loader=video_loader,
+                error_paths=[])
+
+
     print('number of train: {}'.format(len(train_dataset)))
     print('number of val: {}'.format(len(val_dataset)))
 
@@ -146,8 +219,11 @@ def get_train_val_loader(args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.num_workers, pin_memory=True, sampler=train_sampler)
 
+    bsz = args.batch_size
+    if args.ten_crop:
+        bsz = 4
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
+        val_dataset, batch_size=bsz, shuffle=False,
         num_workers=args.num_workers, pin_memory=True)
 
     return train_loader, val_loader, train_sampler
@@ -155,62 +231,67 @@ def get_train_val_loader(args):
 
 def set_model(args, ngpus_per_node):
     if args.model == 'alexnet':
-        model = alexnet()
-        classifier = LinearClassifierAlexNet(layer=args.layer, n_label=1000, pool_type='max')
+        model = models.__dict__['alexnet'](num_classes=128)
+        model2 = models.__dict__['alexnet'](num_classes=101)
+        classifier = copy.deepcopy(model2.classifier) #LinearClassifierAlexNet(layer=args.layer, n_label=101, pool_type='max')
     elif args.model.startswith('resnet'):
         model = ResNetV2(args.model)
         classifier = LinearClassifierResNetV2(layer=args.layer, n_label=1000, pool_type='avg')
+    elif args.model == 'caffenet':
+        model = CaffeNet_BN(output_layer='fc8', num_classes=101)
     else:
         raise NotImplementedError(args.model)
 
     # load pre-trained model
-    print('==> loading pre-trained model')
-    ckpt = torch.load(args.model_path)
-    state_dict = ckpt['model']
+    if not args.scratch:
+        print('==> loading pre-trained model')
+        ckpt = torch.load(args.model_path)
+        state_dict = ckpt['model']
 
-    has_module = False
-    for k, v in state_dict.items():
-        if k.startswith('module'):
-            has_module = True
-
-    if has_module:
-        from collections import OrderedDict
-        new_state_dict = OrderedDict()
+        has_module = False
         for k, v in state_dict.items():
-            name = k[7:]  # remove `module.`
-            new_state_dict[name] = v
-        model.load_state_dict(new_state_dict)
-    else:
-        model.load_state_dict(state_dict)
+            if k.startswith('module'):
+                has_module = True
+
+        if has_module:
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:]  # remove `module.`
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            model.load_state_dict(state_dict)
+
+    if args.model == 'alexnet':
+        #model.features = get_new_features(model, args.layer, 'alexnet')
+        model.classifier = classifier
+    if args.model == 'caffenet' and not args.scratch and args.resume == '':
+        model.reinit_fc()
 
     print('==> done')
     model.eval()
+    print(model)
 
     if args.distributed:
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
-            classifier.cuda(args.gpu)
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.num_workers = int(args.num_workers / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-            classifier = torch.nn.parallel.DistributedDataParallel(classifier, device_ids=[args.gpu])
         else:
             model.cuda()
             model = torch.nn.parallel.DistributedDataParallel(model)
-            classifier.cuda()
-            classifier = torch.nn.parallel.DistributedDataParallel(classifier)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
-        classifier = classifier.cuda(args.gpu)
     else:
         model = torch.nn.DataParallel(model).cuda()
-        classifier = torch.nn.DataParallel(classifier).cuda()
 
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    return model, classifier, criterion
+    return model, criterion
 
 
 def set_optimizer(args, classifier):
@@ -221,12 +302,11 @@ def set_optimizer(args, classifier):
     return optimizer
 
 
-def train(epoch, train_loader, model, classifier, criterion, optimizer, opt):
+def train(epoch, train_loader, model, criterion, optimizer, opt):
     """
     one epoch training
     """
-    model.eval()
-    classifier.train()
+    model.train()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -235,22 +315,23 @@ def train(epoch, train_loader, model, classifier, criterion, optimizer, opt):
     top5 = AverageMeter()
 
     end = time.time()
-    for idx, (input, target) in enumerate(train_loader):
+    for idx, ele in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
+        ((input, _), target), _ = ele
         input = input.float()
         if opt.gpu is not None:
             input = input.cuda(opt.gpu, non_blocking=True)
         target = target.cuda(opt.gpu, non_blocking=True)
 
-        # ===================forward=====================
-        with torch.no_grad():
-            feat_l, feat_ab = model(input, opt.layer)
-            feat = torch.cat((feat_l, feat_ab), dim=1)
-            feat = feat.contiguous().detach()
+        input = torch.reshape(input, (input.shape[0] * input.shape[1], input.shape[2], input.shape[3], input.shape[4]))
 
-        output = classifier(feat)
+        # ===================forward=====================
+        #with torch.no_grad():
+        #    output = model(input)
+        #    feat = feat.contiguous().detach()
+
+        output = model(input)#classifier(feat)
         loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -285,7 +366,7 @@ def train(epoch, train_loader, model, classifier, criterion, optimizer, opt):
     return top1.avg, losses.avg
 
 
-def validate(val_loader, model, classifier, criterion, opt):
+def validate(val_loader, model, criterion, opt):
     """
     evaluation
     """
@@ -296,22 +377,30 @@ def validate(val_loader, model, classifier, criterion, opt):
 
     # switch to evaluate mode
     model.eval()
-    classifier.eval()
 
     with torch.no_grad():
         end = time.time()
-        for idx, (input, target) in enumerate(val_loader):
-
+        for idx, ele in enumerate(val_loader):
+            ((input, _), target), _ = ele
             input = input.float()
             if opt.gpu is not None:
                 input = input.cuda(opt.gpu, non_blocking=True)
             target = target.cuda(opt.gpu, non_blocking=True)
+            bsz = input.shape[0]
+            if opt.ten_crop:
+                num_frames = input.shape[2]
+                num_crops = input.shape[1]
+                input = torch.reshape(input, (bsz * num_crops * num_frames, input.shape[3], input.shape[4], input.shape[5]))
+            else:
+                num_frames = input.shape[1]
+                input = torch.reshape(input, (bsz * num_frames, input.shape[2], input.shape[3], input.shape[4]))
 
             # compute output
-            feat_l, feat_ab = model(input, opt.layer)
-            feat = torch.cat((feat_l, feat_ab), dim=1)
-            feat = feat.contiguous().detach()
-            output = classifier(feat)
+            #feat = model(input)
+            #feat = feat.contiguous().detach()
+            output = model(input)#classifier(feat)
+            if opt.ten_crop:
+                output = torch.mean(torch.reshape(output, (bsz, num_crops*num_frames, output.shape[-1])), dim=1)
             loss = criterion(output, target)
 
             # measure accuracy and record loss
@@ -341,6 +430,7 @@ def validate(val_loader, model, classifier, criterion, opt):
 
 def main():
     args = parse_option()
+    print(args)
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
     ngpus_per_node = torch.cuda.device_count()
@@ -374,14 +464,14 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
 
     # set the model
-    model, classifier, criterion = set_model(args, ngpus_per_node)
+    model, criterion = set_model(args, ngpus_per_node)
 
     # set optimizer
-    optimizer = set_optimizer(args, classifier)
+    optimizer = set_optimizer(args, model)
 
     cudnn.benchmark = True
 
-    # optionally resume linear classifier
+    # optionally resume model
     args.start_epoch = 1
     if args.resume:
         if os.path.isfile(args.resume):
@@ -392,18 +482,24 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
-            classifier.load_state_dict(checkpoint['classifier'])
+            model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
+            sys.exit(0)
 
     # set the data loader
     train_loader, val_loader, train_sampler = get_train_val_loader(args)
 
     # tensorboard
     logger = tb_logger.Logger(logdir=args.tb_folder, flush_secs=2)
+
+    if args.evaluate:
+        print("==> testing...")
+        test_acc, test_loss = validate(val_loader, model, criterion, args)
+        return
 
     # routine
     for epoch in range(args.start_epoch, args.epochs + 1):
@@ -415,7 +511,7 @@ def main_worker(gpu, ngpus_per_node, args):
         print("==> training...")
 
         time1 = time.time()
-        train_acc, train_loss = train(epoch, train_loader, model, classifier, criterion, optimizer, args)
+        train_acc, train_loss = train(epoch, train_loader, model, criterion, optimizer, args)
         time2 = time.time()
         print('train epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
@@ -423,7 +519,7 @@ def main_worker(gpu, ngpus_per_node, args):
         logger.log_value('train_loss', train_loss, epoch)
 
         print("==> testing...")
-        test_acc, test_loss = validate(val_loader, model, classifier, criterion, args)
+        test_acc, test_loss = validate(val_loader, model, criterion, args)
 
         logger.log_value('test_acc', test_acc, epoch)
         logger.log_value('test_loss', test_loss, epoch)
@@ -435,7 +531,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                         and args.rank % ngpus_per_node == 0):
                 state = {
                     'epoch': epoch,
-                    'classifier': classifier.state_dict(),
+                    'model': model.state_dict(),
                     'best_acc1': best_acc1,
                     'optimizer': optimizer.state_dict(),
                 }
@@ -451,7 +547,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 print('==> Saving...')
                 state = {
                     'epoch': epoch,
-                    'classifier': classifier.state_dict(),
+                    'model': model.state_dict(),
                     'best_acc1': best_acc1,
                     'optimizer': optimizer.state_dict(),
                 }
