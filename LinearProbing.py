@@ -18,8 +18,9 @@ from dataset import RGB2Lab, RGB2YCbCr
 from util import adjust_learning_rate, AverageMeter, accuracy
 
 from models.alexnet import MyAlexNetCMC
+from models.alexnet_stl10 import MyAlexNetSTL10CMC
 from models.resnet import MyResNetsCMC
-from models.LinearModel import LinearClassifierAlexNet, LinearClassifierResNet
+from models.LinearModel import LinearClassifierAlexNet, LinearClassifierAlexNetSTL10, LinearClassifierResNet
 
 from spawn import spawn
 
@@ -33,12 +34,12 @@ def parse_option():
     parser.add_argument('--save_freq', type=int, default=5, help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=32, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=60, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=320, help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.1, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='30,40,50', help='where to decay lr, can be a list')
-    parser.add_argument('--lr_decay_rate', type=float, default=0.2, help='decay rate for learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.03, help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='200,240,280', help='where to decay lr, can be a list')
+    parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam')
@@ -48,15 +49,15 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet',
+    parser.add_argument('--model', type=str, default='alexnet_stl10', choices=['alexnet', 'alexnet_stl10',
                                                                          'resnet50v1', 'resnet101v1', 'resnet18v1',
                                                                          'resnet50v2', 'resnet101v2', 'resnet18v2',
                                                                          'resnet50v3', 'resnet101v3', 'resnet18v3'])
     parser.add_argument('--model_path', type=str, default=None, help='the model to test')
-    parser.add_argument('--layer', type=int, default=6, help='which layer to evaluate')
+    parser.add_argument('--layer', type=int, default=7, help='which layer to evaluate')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet100', 'imagenet'])
+    parser.add_argument('--dataset', type=str, default='stl10', choices=['stl10', 'imagenet100', 'imagenet'])
 
     # add new views
     parser.add_argument('--view', type=str, default='Lab', choices=['Lab', 'YCbCr'])
@@ -107,6 +108,8 @@ def parse_option():
         opt.n_label = 100
     if opt.dataset == 'imagenet':
         opt.n_label = 1000
+    if opt.dataset == 'stl10':
+        opt.n_label = 10
 
     return opt
 
@@ -127,26 +130,47 @@ def get_train_val_loader(args):
         raise NotImplemented('view not implemented {}'.format(args.view))
 
     normalize = transforms.Normalize(mean=mean, std=std)
-    train_dataset = datasets.ImageFolder(
-        train_folder,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            color_transfer,
-            transforms.ToTensor(),
-            normalize,
-        ])
-    )
-    val_dataset = datasets.ImageFolder(
-        val_folder,
-        transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            color_transfer,
-            transforms.ToTensor(),
-            normalize,
-        ])
-    )
+    if args.dataset == 'stl10':
+        train_dataset = datasets.ImageFolder(
+            train_folder,
+            transforms.Compose([
+                transforms.RandomCrop(64),
+                transforms.RandomHorizontalFlip(),
+                color_transfer,
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
+        val_dataset = datasets.ImageFolder(
+            val_folder,
+            transforms.Compose([
+                transforms.CenterCrop(64),
+                color_transfer,
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
+    else:
+        train_dataset = datasets.ImageFolder(
+            train_folder,
+            transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                color_transfer,
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
+        val_dataset = datasets.ImageFolder(
+            val_folder,
+            transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                color_transfer,
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
     print('number of train: {}'.format(len(train_dataset)))
     print('number of val: {}'.format(len(val_dataset)))
 
@@ -164,7 +188,10 @@ def get_train_val_loader(args):
 
 
 def set_model(args):
-    if args.model.startswith('alexnet'):
+    if args.model.startswith('alexnet_stl10'):
+        model = MyAlexNetSTL10CMC()
+        classifier = LinearClassifierAlexNetSTL10(layer=args.layer, n_label=args.n_label, pool_type='max')
+    elif args.model.startswith('alexnet'):
         model = MyAlexNetCMC()
         classifier = LinearClassifierAlexNet(layer=args.layer, n_label=args.n_label, pool_type='max')
     elif args.model.startswith('resnet'):
@@ -198,10 +225,9 @@ def set_model(args):
 
 
 def set_optimizer(args, classifier):
-    optimizer = optim.SGD(classifier.parameters(),
+    optimizer = optim.Adam(classifier.parameters(),
                           lr=args.learning_rate,
-                          momentum=args.momentum,
-                          weight_decay=args.weight_decay)
+                          betas=(args.beta1, args.beta2))
     return optimizer
 
 

@@ -18,6 +18,7 @@ from dataset import RGB2Lab, RGB2YCbCr
 from util import adjust_learning_rate, AverageMeter
 
 from models.alexnet import MyAlexNetCMC
+from models.alexnet_stl10 import MyAlexNetSTL10CMC
 from models.resnet import MyResNetsCMC
 from NCE.NCEAverage import NCEAverage
 from NCE.NCECriterion import NCECriterion
@@ -43,11 +44,11 @@ def parse_option():
     parser.add_argument('--save_freq', type=int, default=10, help='save frequency')
     parser.add_argument('--batch_size', type=int, default=128, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=18, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=240, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=320, help='number of training epochs')
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.03, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='250,300,350', help='where to decay lr, can be a list')
+    parser.add_argument('--lr_decay_epochs', type=str, default='200,240,280', help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam')
@@ -59,18 +60,18 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet',
+    parser.add_argument('--model', type=str, default='alexnet_stl10', choices=['alexnet', 'alexnet_stl10',
                                                                          'resnet50v1', 'resnet101v1', 'resnet18v1',
                                                                          'resnet50v2', 'resnet101v2', 'resnet18v2',
                                                                          'resnet50v3', 'resnet101v3', 'resnet18v3'])
     parser.add_argument('--softmax', action='store_true', help='using softmax contrastive loss rather than NCE')
     parser.add_argument('--nce_k', type=int, default=16384)
-    parser.add_argument('--nce_t', type=float, default=0.07)
+    parser.add_argument('--nce_t', type=float, default=0.1)
     parser.add_argument('--nce_m', type=float, default=0.5)
-    parser.add_argument('--feat_dim', type=int, default=128, help='dim of feat for inner product')
+    parser.add_argument('--feat_dim', type=int, default=64, help='dim of feat for inner product')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet100', 'imagenet'])
+    parser.add_argument('--dataset', type=str, default='stl10', choices=['stl10','imagenet100', 'imagenet'])
 
     # specify folder
     parser.add_argument('--data_folder', type=str, default=None, help='path to data')
@@ -140,13 +141,22 @@ def get_train_loader(args):
         raise NotImplemented('view not implemented {}'.format(args.view))
     normalize = transforms.Normalize(mean=mean, std=std)
 
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.)),
-        transforms.RandomHorizontalFlip(),
-        color_transfer,
-        transforms.ToTensor(),
-        normalize,
-    ])
+    if args.dataset == 'stl10':
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(64),
+            transforms.RandomHorizontalFlip(),
+            color_transfer,
+            transforms.ToTensor(),
+            normalize,
+        ])
+    else:
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.)),
+            transforms.RandomHorizontalFlip(),
+            color_transfer,
+            transforms.ToTensor(),
+            normalize,
+        ])
     train_dataset = ImageFolderInstance(data_folder, transform=train_transform)
     train_sampler = None
 
@@ -166,6 +176,8 @@ def set_model(args, n_data):
     # set the model
     if args.model == 'alexnet':
         model = MyAlexNetCMC(args.feat_dim)
+    elif args.model == 'alexnet_stl10':
+        model = MyAlexNetSTL10CMC(args.feat_dim)
     elif args.model.startswith('resnet'):
         model = MyResNetsCMC(args.model)
     else:
@@ -187,10 +199,9 @@ def set_model(args, n_data):
 
 def set_optimizer(args, model):
     # return optimizer
-    optimizer = torch.optim.SGD(model.parameters(),
+    optimizer = torch.optim.Adam(model.parameters(),
                                 lr=args.learning_rate,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+                                betas=(args.beta1, args.beta2))
     return optimizer
 
 
@@ -271,6 +282,7 @@ def main():
 
     # parse the args
     args = parse_option()
+    print(args)
 
     # set the loader
     train_loader, n_data = get_train_loader(args)
