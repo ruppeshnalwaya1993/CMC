@@ -37,9 +37,9 @@ def parse_option():
     parser.add_argument('--epochs', type=int, default=320, help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.03, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='280', help='where to decay lr, can be a list')
-    parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.001, help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='120,160', help='where to decay lr, can be a list')
+    parser.add_argument('--lr_decay_rate', type=float, default=0.2, help='decay rate for learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam')
@@ -190,7 +190,7 @@ def get_train_val_loader(args):
 def set_model(args):
     if args.model.startswith('alexnet_stl10'):
         model = MyAlexNetSTL10CMC()
-        classifier = LinearClassifierAlexNetSTL10(layer=args.layer, n_label=args.n_label, pool_type='max')
+        classifier = LinearClassifierAlexNetSTL10(layer=args.layer, n_label=args.n_label, pool_type='avg')
     elif args.model.startswith('alexnet'):
         model = MyAlexNetCMC()
         classifier = LinearClassifierAlexNet(layer=args.layer, n_label=args.n_label, pool_type='max')
@@ -225,10 +225,9 @@ def set_model(args):
 
 
 def set_optimizer(args, classifier):
-    optimizer = optim.SGD(classifier.parameters(),
+    optimizer = optim.Adam(classifier.parameters(),
                           lr=args.learning_rate,
-                          momentum=args.momentum,
-                          weight_decay=args.weight_decay)
+                          betas=(args.beta1, args.beta2))
     return optimizer
 
 
