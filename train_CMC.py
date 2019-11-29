@@ -199,9 +199,10 @@ def set_model(args, n_data):
 
 def set_optimizer(args, model):
     # return optimizer
-    optimizer = torch.optim.Adam(model.parameters(),
+    optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
-                                betas=(args.beta1, args.beta2))
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
     return optimizer
 
 
